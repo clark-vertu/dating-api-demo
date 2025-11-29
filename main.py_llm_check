@@ -1,0 +1,183 @@
+import base64
+import os
+import tempfile
+from typing import Dict, Any
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
+from groq import Groq
+
+app = FastAPI()
+
+# 开发阶段直接全开放 CORS，方便你用真机调试
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 使用环境变量里的 GROQ_API_KEY，Railway 上配置
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+client = Groq(api_key=GROQ_API_KEY)
+
+# ========== 新增：简单内存缓存，用于存储会话上下文（上一个AI回复） ==========
+# 注意：生产环境用Redis等；demo用dict即可
+session_context: Dict[str, str] = {}  # key: session_id, value: last_assistant_text
+# =================================================
+
+@app.post("/api/voice_chat")
+async def voice_chat(
+    file: UploadFile = File(...),
+    is_interruption: str = Form(default="false"),
+    session_id: str = Form(default=""),
+) -> Dict[str, str]:
+    """
+    接收一个音频文件（wav/m4a 等），
+    1) STT: whisper-large-v3
+    2) LLM: llama3-8b-8192
+    3) TTS: playai-tts
+    返回:
+    {
+      "user_text": "...",
+      "assistant_text": "...",
+      "audio_base64": "..."
+    }
+    """
+    if file is None:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+    filename = file.filename or "audio.m4a"
+    # ---------- 1. STT：whisper-large-v3 ----------
+    # 参考官方文档，通过 Groq SDK 调用 audio.transcriptions.create
+    try:
+        transcription = client.audio.transcriptions.create(
+            file=(filename, audio_bytes),  # (file_name, bytes)
+            model="whisper-large-v3",  # 固定为你要求的模型
+            response_format="json",
+            temperature=0.0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT failed: {e}")
+    user_text = getattr(transcription, "text", None)
+    print("user_text", user_text)
+    if not user_text:
+        raise HTTPException(status_code=500, detail="STT result has no text")
+
+    # ---------- 新增：如果is_interruption=true，且user_text无意义，返回空audio ----------
+    if is_interruption.lower() == "true" and (not user_text.strip() or len(user_text) < 3):
+        return {
+            "user_text": user_text,
+            "assistant_text": "",
+            "audio_base64": "",
+        }
+    # =================================================
+
+    # ---------- 2. LLM：llama3-8b-8192 ----------
+    system_content = "You are a concise, helpful voice assistant. Answer in short sentences."
+    if is_interruption.lower() == "true":
+        system_content += " The user interrupted your previous response. Start your response with a smooth transition phrase like 'Okay, let me check that for you.' or 'Sure, switching topics now.'"
+        # 新增：如果有session_id，附加上轮上下文
+        if session_id and session_id in session_context:
+            system_content += f" Previous response (interrupted): {session_context[session_id]}"
+
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_content,
+                },
+                {"role": "user", "content": user_text},
+            ],
+            max_completion_tokens=256,
+            temperature=0.7,
+        )
+        assistant_text = completion.choices[0].message.content
+        print("assistant_text", assistant_text)
+
+        # 新增：存储到上下文（覆盖上一个）
+        if session_id:
+            session_context[session_id] = assistant_text
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM failed: {e}")
+
+    # ---------- 3. TTS：playai-tts ----------
+    # 官方示例：client.audio.speech.create(...).write_to_file("speech.wav")
+    try:
+        tts_response = client.audio.speech.create(
+            model="playai-tts",  # 或 "playai-tts-arabic"
+            voice="Fritz-PlayAI",  # 任意一个官方支持的 English voice
+            input=assistant_text,
+            response_format="wav",  # 默认也是 wav，这里显式写上
+        )
+        # 为了简单，按官方方式写入一个临时文件再读回来
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            temp_path = tmp.name
+        tts_response.write_to_file(temp_path)
+        with open(temp_path, "rb") as f:
+            audio_wav_bytes = f.read()
+        os.remove(temp_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
+    audio_base64 = base64.b64encode(audio_wav_bytes).decode("utf-8")
+    return {
+        "user_text": user_text,
+        "assistant_text": assistant_text,
+        "audio_base64": audio_base64,
+    }
+
+# ========== 新增：验证打断端点 ==========
+@app.post("/api/validate_interrupt")
+async def validate_interrupt(
+    file: UploadFile = File(...),
+    session_id: str = Form(default=""),
+) -> Dict[str, Any]:
+    """
+    验证短音频是否为有效的人声打断。
+    返回: {"is_valid": bool, "user_text": str}
+    """
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        return {"is_valid": False, "user_text": ""}
+
+    filename = file.filename or "short.m4a"
+
+    try:
+        transcription = client.audio.transcriptions.create(
+            file=(filename, audio_bytes),
+            model="whisper-large-v3",
+            temperature=0.0,
+        )
+        user_text = getattr(transcription, "text", "").strip()
+        if not user_text or len(user_text) < 3:
+            return {"is_valid": False, "user_text": ""}
+
+        # LLM 判断（加上下文：如果有session_id，获取上轮AI text）
+        previous_assistant_text = ""
+        if session_id and session_id in session_context:
+            previous_assistant_text = session_context[session_id]
+
+        system_prompt = "Judge if this is a meaningful human speech interruption (not noise, echo, or irrelevant). Reply only with 'Yes' or 'No'."
+        user_prompt = f"Text: {user_text}. Previous AI response: {previous_assistant_text}"
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+        response = completion.choices[0].message.content.strip().lower()
+        is_valid = response.startswith("yes")
+
+        return {"is_valid": is_valid, "user_text": user_text if is_valid else ""}
+    except Exception as e:
+        print(f"Validate error: {e}")
+        return {"is_valid": False, "user_text": ""}
+# =================================================
